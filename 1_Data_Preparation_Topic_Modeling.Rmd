@@ -1,0 +1,459 @@
+# NLP for Demographers 1: Data Preparation and Topic Modeling with Survey Texts
+
+## Introduction
+
+In the following R markdown files, we will apply different NLP techniques to show you how we get valuable information from unstructured text. In 2021 we gathered comments on fertility perspectives from 433 Dutch women through the LISS panel. We were wondering whether 'the population chatters' (Trinitapoli 2021) - ongoing conversations with socially salient others about demographic phenomena - could be used to reveal factors and motivations behind fertility intentions, and to predict which persons are more likely to have children in the long-term future. Read this post to see how that worked out. We used topic modeling as a tool to extract information from the survey response texts and combined that with predictive modeling techniques to examine our predictions. By showing what we did and how we did it, we hope to guide other demographers that are keen to use textual data for their own research endeavours.
+
+Most of the content introduced here can be found in the free, online book [Text Mining in R](https://www.tidytextmining.com/), a work by [Julia Silge](http://juliasilge.com/) and [David Robinson](http://varianceexplained.org/) licensed under a Creative Commons Attribution-NonCommercial-ShareAlike 3.0 United States License.
+
+## Step 0: Setting up our environment
+
+First, we set up our environment with the required packages to prepare and explore our data. In preparing and exploring the data we need two packages: tidyverse and tidytext.
+
+```{r}
+library(tidyverse)
+library(tidytext)
+```
+
+## Step 1: Exploring and preparing our text data
+
+Now, let's have a look at the data. Our raw survey data consists of 433 responses with 8 columns, containing background of each person (age, education, income, partnership), their long-term fertility intention ("Definitely yes", "Probably yes", "Do not know", "Probably not", "Definitely not") and of course the open response. Here's an overview:
+
+```{r}
+rawdata <- read.csv(file = 'fertility_intentions.csv', header=TRUE)
+str(rawdata)
+```
+
+For now, we're primarily interested in the open answers:
+
+```{r}
+rawdata %>% select(text) %>% sample_n(5,seed=42) %>% pull()
+```
+
+To get a better understanding of our data, let's check the most frequent, identical texts:
+
+```{r}
+rawdata %>% 
+    group_by(text) %>% 
+    summarize(n_ans=n()) %>% 
+    mutate(pct=n_ans/sum(n_ans)) %>%
+    arrange(-n_ans) %>% 
+    top_n(5,n_ans) 
+```
+
+Here we make a preprocessing decision with potential high impact on later analysis steps: We remove punctuation entirely from our data. Since we want to focus on total response texts in our analyses and not on the sentences within, this is ok for us now. For other analyses, this might not be the case.
+
+```{r}
+data <- rawdata %>% 
+  # replace linebreaks and some punctuation with space and remove other punctuation and set to lower case.
+  mutate(textClean=gsub('[[:punct:]]+', '',gsub('\\\\n|\\.|\\,|\\;',' ',tolower(text))))
+```
+
+## Step 2: Tokenize our data
+
+Now that we've done some cleaning on the text level we can look at the *token* level more closely. In NLP terms, a *token* is a string of contiguous characters between two spaces. Therefore, we need to split our full response texts into sets of tokens. Next, we can answer questions such as: How long should a response be to be of value to us when we want to identify topics in the responses? And: Do we want to use all tokens or are some tokens not that relevant for us and is it better to remove them?
+
+```{r}
+## divide text into separate words
+text_tokens <- data %>% 
+    select(X, textClean) %>%
+    unnest_tokens(word, textClean)  
+
+text_tokens %>% 
+  group_by(X) %>% summarise(n_tokens = n()) %>% mutate(n_tokens_binned = cut(n_tokens, breaks = c(0,seq(25,250,25),Inf))) %>% 
+  group_by(n_tokens_binned) %>% summarise(n_responses = n()) %>% 
+  ggplot(aes(x=n_tokens_binned,y=n_responses)) + geom_bar(stat='identity',fill='blue') + theme_minimal() 
+```
+
+### Stemming & Lemmatization
+
+Stemming & Lemmatization means trying to make your tokens more generic by replacing it by its simplest (original) form. For plurals (e.g. children) this would mean replacing it with singulars (child), for verbs (making) to the root of the verb (make). With stemming, the last part of the word is cut off to bring it to its more original form, with lemmatization this is done a bit more thorough by taking into consideration the morphological analysis of the words. Both techniques have their pros and cons - computationally and in the usefullness of the resulting tokens - and depending on your research question you can choose to apply one or the other. Or you can decide that it's doing more harm than good in your case. Since there's little work on Dutch stemming and Lemmatization techniques implemented in R, we decided not to apply either stemming or lemmatization here. You may use the SmowballC (<https://cran.r-project.org/web/packages/SnowballC/index.html>) package to stem the words if you are interested; please don't forget to compare results with and without it.
+
+```{r}
+# implement you stemming step here
+```
+
+### Stop words
+
+Stop words are words that are determined to have no added value and we're better off without them. Not always, especially not when your analysis focuses on the exact structure of the text or when you are specifically interested in the use of specific highly frequent words including stop words. Also, in sentiment analysis, usage of stop words might be relevant. However, we primarily want to distill the topics discussed by respondents, so we'd like to focus on those terms that are not too frequent and tokens that help in revealing information relevant in the context.
+
+There are - in all languages - many nice sources of stop words available. As a rule of thumb, it is wise to review and edit a list of potential stop words carefully. We collected a list of stop words for Dutch, modified based on the [Stopword ISO](https://github.com/stopwords-iso) standard.
+
+```{r}
+# load default stopwords
+stopwords_file <- file("nl_stopwords.txt", "r")
+stopwords <- readLines(stopwords_file)
+cat(paste0('First 50 stop words: ',paste(stopwords[1:50], collapse=', '),', ...'))
+
+```
+
+You may choose to add or exclude some words in your customized stopword list.
+
+```{r}
+# you can choose to exclude some stopwords
+excludefromstopwords <- c()
+stopwords <- stopwords[!stopwords %in% excludefromstopwords]
+cat(paste0('Number # of stop words after removing ',length(excludefromstopwords),' stop words: ',length(stopwords),'\n\n'))
+
+
+# add your own stopwords here
+extra_stop_words <- c()
+stop_words <- data.frame(word=unique(c(stopwords,extra_stop_words)),stringsAsFactors = F)
+stop_words <- stop_words %>% mutate(stopword=1)
+cat(paste0('Number of stop words after including ',length(extra_stop_words),' extra stop words: ',sum(stop_words$stopword)))
+
+```
+
+Let's check the difference with and without our stopwords as we go, to get an impression of the process.
+
+```{r}
+# First, let's check how a random text looked before removing stopwords...
+exampletext = text_tokens %>% ungroup() %>% distinct(X) %>% sample_n(size=1,seed=42)
+data %>% filter(X==pull(exampletext))  %>% select(text) %>% pull() %>% paste0('\n\n') %>% cat()
+
+# remove stopwords
+text_tokens_ex_sw <- text_tokens %>% left_join(y=stop_words, by="word") %>%
+    filter(is.na(stopword))
+
+# ... and recheck how that response text looks after removing stopwords
+text_tokens_ex_sw %>% filter(X==exampletext$X) %>% summarize(text_cleaned=paste(word,collapse=' ')) %>% pull() %>% cat()
+
+```
+
+As this single example already shows, the number of tokens and thereby the response lengths have decreased, but the essential words are still present in the texts. Rerunning the response text length plot shows that our texts have shrunk in size:
+
+```{r}
+# check new lengths after removing stop words
+text_tokens_ex_sw %>% 
+  group_by(X) %>% summarise(n_tokens = n()) %>% mutate(n_tokens_binned = cut(n_tokens, breaks = c(0,seq(25,250,25),Inf))) %>% 
+  group_by(n_tokens_binned) %>% summarise(n_responses = n()) %>% 
+  ggplot(aes(x=n_tokens_binned,y=n_responses)) + geom_bar(stat='identity',fill='orange') + theme_minimal() 
+```
+
+### N-grams
+
+So far we only used tokens of single words, but combinations of subsequent words - named n-grams for n adjacent words - are also very useful tokens in many NLP tasks. In the previous step, we removed stopwords. We need to perform identification of relevant n-grams on the texts prior to removing stopwords, otherwise we end up with many n-grams that actually were not present in the text but are a result of removing one or more intermediary terms.
+
+```{r}
+# create bigrams (2-grams) with the unnest_tokens function, specifying the ngram length (2)
+# you may change the number of n and see the effects
+bigrams <- text_tokens %>%
+    group_by(X)  %>% summarize(textClean=paste(word, collapse=' ')) %>%
+    unnest_tokens(bigram, token = "ngrams",n = 2, textClean)
+
+print(paste0('Total number of bigrams: ',dim(bigrams)[1]))
+
+# remove bigrams containing stopwords
+bigrams_separated <- bigrams %>%
+    separate(bigram, c('word1', 'word2'), sep=" ")
+
+bigrams_filtered <- bigrams_separated %>%
+    filter(!word1 %in% stop_words$word & !word2 %in% stop_words$word)
+
+bigrams_united <- bigrams_filtered %>%
+    unite(bigram, word1, word2, sep = '_')
+
+print(paste0('Total number of bigrams without stopwords: ',dim(bigrams_united)[1]))
+
+# show most frequent bigrams
+top10_bigrams = bigrams_united %>% group_by(bigram) %>% summarize(n=n()) %>% top_n(10,wt=n) %>% select(bigram) %>% pull()
+print(paste0('Most frequent bigrams: ',paste(top10_bigrams,collapse=", ")))
+```
+
+When preparing the text data, we'll combine the unigrams and bigrams. Since bigrams are not always useful in all other NLP methods, we keep the bigrams in a separate field so we can easily include or exclude them when using different NLP techniques.
+
+## Step 3: Simple Sentiment Analysis
+
+Since we already did a bit of cleaning on some of the extra features, we can add a simple sentiment score to each response. Sentiment analysis is a broad field within NLP and can be done in serveral ways. Here, we take advantage of pretrained Dutch sentiment lexicons that are made available by the [Data Science Lab](https://datasciencelab.nl/en/). They provide a list of positive and negative words; using this list we calculate a sentiment score by summing all positive words (+1) and all negative words (-1) and standardizing by the total number of positive/negative words in the text.
+
+```{r}
+# read in sentiment words from Data Science Lab (https://sites.google.com/site/datascienceslab/projects/multilingualsentiment)
+positive_words_nl <- read_csv("https://bhciaaablob.blob.core.windows.net/cmotionsnlpblogs/positive_words_nl.txt", col_names=c('word'),col_types='c') %>% mutate(pos=1,neg=0) 
+negative_words_nl <- read_csv("https://bhciaaablob.blob.core.windows.net/cmotionsnlpblogs/negative_words_nl.txt", col_names=c('word'),col_types='c') %>% mutate(pos=0,neg=1) 
+
+# combine positive and negative tokens and print statistics
+sentiment_nl <- rbind(positive_words_nl, negative_words_nl) 
+sentiment_nl %>% summarize(sentiment_words=n_distinct(word),positive_words=sum(pos),negative_words=sum(neg)) %>% print()
+
+# score sentiment for response texts
+text_sentiment <- data %>% select(X, textClean) %>% unnest_tokens(word, textClean) %>%
+  left_join(sentiment_nl,by='word') %>% 
+  group_by(X) %>% summarize(positive=sum(pos,na.rm=T),negative=sum(neg,na.rm=T)) %>% 
+  mutate(sentiment = positive - negative, 
+         sentiment_standardized = case_when(positive + negative==0~0,TRUE~sentiment/(positive + negative)))
+
+# plot histogram of sentiment score
+text_sentiment %>% ggplot(aes(x=sentiment_standardized))+ geom_histogram(fill='navyblue') + theme_minimal() +labs(title='histogram of sentiment score (standardized)')
+```
+
+Please note that here we did not consider the order and combination of words; therefore we would expect a bias towards positive side (e.g. because we ignored "niet"). More advanced sentiment analysis would help us to overcome this bias.
+
+### Wrap up
+
+To generate a csv with only the ID and the cleaned text, we take our processed tokens dataframe, group by the ID and combine the tokens into a text again.
+
+```{r}
+# original text
+rawText <- data %>% select(X,text) 
+# add cleaned text
+textClean <- text_tokens_ex_sw %>% group_by(X) %>% summarize(textClean=paste(word,collapse=' '))
+# add bigrams without stopwords
+textBigrams <- bigrams_united %>% group_by(X) %>% summarize(bigrams=paste(bigram,collapse=' ')) 
+
+# combine original text with cleaned text
+responses <- rawText %>% inner_join(textClean,by='X') %>% left_join(textBigrams,by='X')
+
+#write to file
+write.csv(responses,'responses.csv',row.names=FALSE)
+```
+
+In the raw response data, we have more than only response texts available: age, education, family, etc. We want to focus on NLP to show you how to do that, but we also want to show you how to combine features created with NLP techniques with other features you might be more familiar with: numeric and categorical features.
+
+```{r}
+features <- data %>% 
+  inner_join(text_sentiment,by='X') %>% 
+  select(X, sentiment_standardized, age, income, partner, education, maternity) 
+
+write.csv(features,'features.csv',row.names=FALSE)
+
+```
+
+Now that we have finished cleaning and preprocessing the textual data, we can put them into some real NLP applications.
+
+## Step 4: Preparing for Topic Modeling
+
+To discover the topics that respondents write about in their open answers, we use Topic Modeling. But what is a Topic Model? In machine learning and natural language processing, a topic model is a type of statistical model that can be used for discovering the abstract topics that occur in a collection of documents. There are a number of algorithms to extract topics from a collection of texts, but the Latent Dirichlet Allocation is one of the most popular algorithms because it is efficient en results in highly interpretable topics. Interpretability of topics is an important feature of a topic model, since we do not only want to find statistically relevant groupings of words, we also want to be able to label the identified topics with a topic name that others can relate to. As such, topic modeling has some similarities to clustering methods, such as KMeans.
+
+![](images/TopicModel_LDA_Blei_highres.png)
+
+As the figure shows:
+
+-   Each topic is a distribution over words
+-   Each document is a distribution over topics
+
+So after we are done topic modeling our responses:
+
+-   we shoud know what are the topics or subjects that respondents write about their fertility plans
+-   we know what tokens or words are most important in these topics
+-   we can tell for each individual respondent to what extent it is about the identified topics and this can be a mix - 80% about topic X and 20% about topic Y.
+
+### Topic modeling packages
+
+```{r}
+library(topicmodels)
+library(tm)
+library(LDAvis)
+```
+
+-   `topicmodels` is a package to estimate topic models with LDA and builds upon data structures created with the tm package
+-   `tm` is a powerful, generic package with all sorts of text mining functionality, among which creating document term matrices, which we need for topic modeling
+-   `ldavis` is a great package to visualise and interpret the topic model and a very helpful when labeling topics
+
+### Combining unigrams and bigrams
+
+```{r}
+## combine unigrams and bigrams into †extClean and divide text into separate words
+response_tokens <- responses %>% 
+    mutate(textClean = paste(textClean,bigrams, sep=' ')) %>%
+    select(X, textClean) %>%
+    unnest_tokens(token, textClean) %>%
+    group_by(X) %>% mutate(n_tokens = n()) %>% filter(n_tokens>=3) %>% ungroup() %>% select(-n_tokens) 
+# filter out responses with less than 3 tokens. You can change that by changing the filter for n_tokens
+
+# summarize result after tokenization
+str(response_tokens)
+
+```
+
+### Filter tokens
+
+Now that we've added bigrams to the tokens and we've re-tokenized our texts, we still have many, many unique tokens available for our topic model. It's best practice to get rid of the longtail of infrequent terms. Let's first have a look at what the distribution of token frequency looks like.
+
+```{r}
+response_tokens %>% 
+  group_by(token) %>% summarize(token_freq=n()) %>% 
+  mutate(token_freq_binned = case_when(token_freq>20~20,TRUE~as.numeric(token_freq))) %>% 
+  group_by(token_freq_binned) %>% summarise(n_tokens = n()) %>% 
+  mutate(pct_tokens = n_tokens/sum(n_tokens),
+         cumpct_tokens = cumsum(n_tokens)/sum(n_tokens)) %>% 
+  ggplot(aes(x=token_freq_binned)) + 
+          scale_y_continuous(labels = scales::percent_format(accuracy = 1)) + 
+          geom_bar(aes(y=pct_tokens),stat='identity',fill='blue') +  
+          geom_line(aes(y=cumpct_tokens),stat='identity',color='orange',linetype='dashed') + 
+          geom_text(aes(y=cumpct_tokens,label=scales::percent(cumpct_tokens,accuracy=1)),size=3) + 
+          theme_minimal() + 
+          ggtitle("Frequency of token in Corpus (all responses)") + xlab("token frequency") + ylab("% of all tokens")
+
+```
+
+There are multiple ways of filtering tokens: by removing tokens that appeared less than n times in the corpus:
+
+```{r}
+# here we used n = 3; you may try to change that
+token_freq_threshold = 3
+response_tokens %>% 
+  group_by(token) %>% summarize(token_freq=n()) %>% 
+  mutate(min_n_freq = case_when(token_freq<token_freq_threshold~'token frequency: <n',TRUE~'token frequency: >=n')) %>% 
+  group_by(min_n_freq) %>% summarise(n_unique_tokens = n(),n_tokens=sum(token_freq)) %>% 
+  mutate(pct_unique_tokens = scales::percent(n_unique_tokens / sum(n_unique_tokens)),pct_all_tokens=scales::percent(n_tokens / sum(n_tokens)))
+
+# remove infrequent tokens
+response_tokens_train_smpl <- response_tokens %>% 
+  group_by(token) %>% 
+  mutate(token_freq=n()) %>%  
+  filter(token_freq>=token_freq_threshold)
+
+```
+
+Or you can use the TF-IDF (Term Frequency - Inverse Document Frequency) transformation:
+
+```{r}
+response_tokens %>% 
+  count(X, token, sort = TRUE) %>%
+  bind_tf_idf(token, X, n)
+
+# using tf-idf as frequency value
+response_tokens_train_smpl <- response_tokens %>% 
+  count(X, token, sort = TRUE) %>%
+  bind_tf_idf(token, X, n) %>% 
+  mutate(token_freq=as.integer(tf_idf*100)) %>% # LDA package only supports integers as freqs
+  select(X, token, token_freq) %>%
+  arrange(X)
+```
+
+Please choose **One of the two blocks above** to filter your tokens.
+
+### Document-Term Matrix
+
+```{r}
+# create document term matrix
+dtm <- response_tokens_train_smpl %>% 
+  cast_dtm(document = X,term = token,value = token_freq)
+
+#check dimenstions of dtm
+cat(paste0('DTM dimensions: Documents (',dim(dtm)[1],') x Tokens (',dim(dtm)[2],')',' (average token frequency: ',round(sum(dtm)/sum(dtm!=0),2),')'))
+```
+
+## Step 5: Training and evaluating Topic Models
+
+The most impactful parameter in Topic Modeling is k: the number of topics to identify. How to pick a value for is partly a result of discussion (what number of topics do we expect to find in this context?) and trial & error (try different values of k, evaluate results). Some data scientists might not like this, they prefer to look at statistics to guide them in this process, but for those familiar with other unsupervised data science techniques like KMeans this is not that new.
+
+Let's start with a topic model to identify 5 topics and explore the result. We keep all other hyperparameters as defaults at this point.
+
+```{r}
+lda_fit <- LDA(dtm, k = 5)
+```
+
+The model is trained. Let's explore the results! The fitted lda object contains a number of matrices:
+
+-   phi: matrix with distribution of tokens (in rows) over topics (in columns)
+-   theta: matrix with distribution of documents (hence: responses, in rows) over topics (in columns)
+
+Both for phi and for theta, the sum over all columns is equal to 1, meaning:
+
+-   For phi, the sum of all token scores within a topic is 1 - higher scores meaning higher importance of that token within the topic.
+-   For theta, the sum of all topic scores within a document is 1 - higher scores meaning the topic is more relevant in that document.
+
+```{r}
+# phi (topic - token distribution matrix) -  topics in rows, tokens in columns:
+phi <- posterior(lda_fit)$terms %>% as.matrix
+cat(paste0('Dimensions of phi (topic-token-matrix): ',paste(dim(phi),collapse=' x '),'\n'))
+cat(paste0('phi examples (8 tokens): ','\n'))
+phi[,1:8] %>% as_tibble() %>% mutate_if(is.numeric, round, 5) %>% print()
+```
+
+```{r}
+# theta (document - topic distribution matrix) -  documents in rows, topic probs in columns:
+theta <- posterior(lda_fit)$topics %>% as.matrix
+cat(paste0('\n\n','Dimensions of theta (document-topic-matrix): ',paste(dim(theta),collapse=' x '),'\n'))
+cat(paste0('theta examples (8 documents): ','\n'))
+theta[1:8,] %>% as_tibble() %>% mutate_if(is.numeric, round, 5) %>% setNames(paste0('Topic', names(.))) %>% print()
+
+```
+
+To explore our topic model, we visualize the most important tokens per topic. You may need to install `gridExtra` and `reshape2` if you see an error message.
+
+```{r}
+
+# get token probability per token per topic
+topics <- tidy(lda_fit)
+
+# only select top-10 terms per topic based on token probability within a topic
+plotinput <- topics %>%
+  mutate(topic = as.factor(paste0('Topic',topic))) %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>% 
+  ungroup() %>%
+  arrange(topic, -beta)
+
+# plot highest probability terms per topic
+names <- levels(unique(plotinput$topic))
+colors <- RColorBrewer::brewer.pal(n=length(names),name="Set2")
+
+plist <- list()
+
+for (i in 1:length(names)) {
+  d <- subset(plotinput,topic == names[i])[1:10,]
+  d$term <- factor(d$term, levels=d[order(d$beta),]$term)
+  
+  p1 <- ggplot(d, aes(x = term, y = beta, width=0.75)) + 
+  labs(y = NULL, x = NULL, fill = NULL) +
+  geom_bar(stat = "identity",fill=colors[i]) +
+  facet_wrap(~topic) +
+  coord_flip() +
+  guides(fill=FALSE) +
+  theme_bw() + theme(strip.background  = element_blank(),
+                     panel.grid.major = element_line(colour = "grey80"),
+                     panel.border = element_blank(),
+                     axis.ticks = element_line(size = 0),
+                     panel.grid.minor.y = element_blank(),
+                     panel.grid.major.y = element_blank() ) +
+  theme(legend.position="bottom") 
+
+  plist[[names[i]]] = p1
+}
+
+library(gridExtra)
+do.call("grid.arrange", c(plist, ncol=5))
+```
+
+An even better approach of evaluating a topic model is to explore the topic model from both the topic-word and document-topic perspectives, which can be achieved by using the LDAvis package that specialize on visualizing topic models. LDAvis needs a JSON containing information about your topic model and vocabulary:
+
+```{r}
+# phi (topic - token distribution matrix) -  tokens in rows, topic scores in columns:
+phi <- posterior(lda_fit)$terms %>% as.matrix 
+
+# theta (document - topic distribution matrix) -  documents in rows, topic probs in columns:
+theta <- posterior(lda_fit)$topics %>% as.matrix 
+
+# number of tokens per document
+doc_length <- response_tokens_train_smpl %>% group_by(X) %>% summarize(doc_length=n()) %>% select(doc_length) %>% pull() 
+
+# vocabulary: unique tokens
+vocab <- colnames(phi) 
+
+# overall token frequency
+term_frequency <- response_tokens_train_smpl %>% group_by(token) %>% summarise(n=n()) %>% arrange(match(token, vocab)) %>% select(n) %>% pull() 
+
+
+# create JSON containing all needed elements
+json <- createJSON(phi, theta, doc_length, vocab, term_frequency)
+serVis(json) 
+```
+
+### Try with different preprocessing/parameters, and see if you find a pattern from the responses!
+
+Topic modeling is - just like cluster analysis and other unsupervised machine learning techniques - often more art than science. Therefore, we encourage you to spend some time tweaking your topic model before you end up with your 'final' results. In carving your optimal topic model, here are your most important tools:
+
+-   change k - the number of topics
+-   exclude extra 'too dominant (frequent)' tokens (by adding stopwords, increasing frequency threshold, or changing the n for n-grams)
+-   sample documents to focus on the most relevant documents to find important topics
+-   changing LDA hyperparameters - you may find the documentation at <https://rdrr.io/cran/topicmodels/man/lda.html>
+
+## Have fun!
+
+Hope you are enjoying twerking your topic models! A great thing about topic modeling - and especially LDA - is that when all the tweaking and struggling is done, you are likely to end up with a manageable number of nicely interpretable topics. This allows you to add for each document the distribution over those topics. Since the topic probabilities sum to 1 and are numeric values, you now have summarized the unstructured, different length texts into just a few new, easy to process features. Features that can be of great value in downstream tasks like predictive modeling or segmentation tasks.
+
+However, there is a lot of subjectivity in finding the 'best' topic model, and your results will never be not challenged. There might be multiple statistically equivalent or superior solutions that can differ substantially in the resulting topics. So, even when your data or method only slightly change, there is still the chance that the interpretation of the results changes dramatically. Make sure you keep track of each run, by saving the combination of seeds, parameters, preprocessing choices and datasets.
+
+

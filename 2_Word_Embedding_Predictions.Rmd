@@ -1,0 +1,278 @@
+# NLP for Demographers 2: Word Embedding, Document Representation and Predicting Fertility Intentions with Survey Texts
+
+## Introduction
+
+In the following R markdown files, we will apply different NLP techniques to show you how we get valuable information from unstructured text. In 2021 we gathered comments on fertility perspectives from 433 Dutch women through the LISS panel. We were wondering whether 'the population chatters' (Trinitapoli 2021) - ongoing conversations with socially salient others about demographic phenomena - could be used to reveal factors and motivations behind fertility intentions, and to predict which persons are more likely to have children in the long-term future. Read this post to see how that worked out. We used topic modeling as a tool to extract information from the survey response texts and combined that with predictive modeling techniques to examine our predictions. By showing what we did and how we did it, we hope to guide other demographers that are keen to use textual data for their own research endeavours.
+
+Most of the content introduced here can be found in the free, online book [Text Mining in R](https://www.tidytextmining.com/), a work by [Julia Silge](http://juliasilge.com/) and [David Robinson](http://varianceexplained.org/) licensed under a Creative Commons Attribution-NonCommercial-ShareAlike 3.0 United States License.
+
+In this workbook we introduce Word Embedding and show you how a `Word2Vec` model is trained, and how is it used in modeling open responses and predictive modeling.
+
+*PLEASE NOTE: This workbook requires Python and Tensorflow to run.* If you do not have Python yet, please [Download Python](https://www.python.org/downloads/). You may use `pip install tensorflow` in Python to install Tensorflow.
+
+## Step 0: Setting up our environment
+
+First, we set up our environment with the required packages to prepare and explore our data. To prepare word embedding models, we need the following package:
+
+```{r}
+library(text2vec)
+library(tidyverse)
+library(tidytext)
+library(uwot)
+library(caret)
+```
+
+ - `text2vec` a very memory efficient package used for text analysis. We use is here for the native GloVe support to build our model;
+ - `keras` a popular package for building neural networks, a user friendly interface connected to the Tensorflow back-end, written in Python;
+ - `uwot` is the R implementation of UMAP, a general purpose dimensionality reduction algorithm which is useful here to visualise the word embeddings.
+ - `caret` (Classification And REgression Training) is a set of functions that attempt to streamline the process for creating predictive models.
+ 
+
+```{r}
+library(devtools)
+devtools::install_github("rstudio/tensorflow")
+reticulate::install_python()
+library(tensorflow)
+install_tensorflow(envname = "r-tensorflow")
+install.packages("keras3")
+library(keras)
+install_keras()
+```
+
+```{r}
+library(keras3)
+
+```
+
+
+### Loading saved data
+
+```{r}
+rawdata <- read.csv(file = 'fertility_intentions.csv', header=TRUE)
+responses <- read.csv(file = 'responses.csv',header=TRUE,stringsAsFactors=FALSE)
+response_tokens <- responses %>% 
+    select(X, textClean) %>%
+    unnest_tokens(word, textClean)
+response_new <- response_tokens %>%
+  group_by(word) %>% 
+  mutate(token_freq=n()) %>% 
+  group_by(X) %>%
+  summarise(textClean = str_c(word, collapse = " "))
+```
+
+Before we go any further we will split our files into train and test datasets. This way we ensure not only that we avoid overfitting but also that results are comparable with other models on the same data. 
+
+```{r}
+# gerenate a sample of 80% of responses, used for training purposes (filter responses with prepared text)
+set.seed(42) 
+sample <- sample.int(n = nrow(response_tokens), size = floor(.8*nrow(response_tokens)), replace = F)
+response_tokens$train = 0
+response_tokens$train[sample] = 1
+trainids = response_tokens  %>% select(X,train) %>% filter()
+```
+
+```{r}
+rawdata <- read.csv(file = 'fertility_intentions.csv', header=TRUE)
+fac <- factor(c("1","2","1","2"))
+# split responses and labels into train and test
+x_train <- trainids %>% left_join(y=response_new, by="X") %>% filter(train == 1) %>% select(textClean) %>% pull()
+x_test <- trainids %>% left_join(y=response_new, by="X") %>% filter(train == 0) %>% select(textClean) %>% pull()
+y_train <- trainids %>% left_join(y=rawdata, by="X") %>% filter(train == 1) %>% select(intention) %>% pull() %>% 
+  factor(levels = c('Waarschijnlijk niet', 'Waarschijnlijk wel', 'Weet het niet', 'Zeker niet', 'Zeker wel'))
+y_test <- trainids %>% left_join(y=rawdata, by="X") %>% filter(train == 0) %>% select(intention) %>% pull() %>% 
+  factor(levels = c('Waarschijnlijk niet', 'Waarschijnlijk wel', 'Weet het niet', 'Zeker niet', 'Zeker wel')) %>%
+  as.matrix()
+
+# count % of michelin restaurants in both train and test responses 
+table(y_train)
+table(y_test)
+y_train <- enframe(y_train) %>%
+  unnest(value) %>%
+  mutate(temp = 1) %>%
+  pivot_wider(names_from = value, values_from = temp, values_fill = list(temp = 0)) %>%
+  select(c('Waarschijnlijk niet', 'Waarschijnlijk wel', 'Weet het niet', 'Zeker niet', 'Zeker wel'))
+y_test <- enframe(y_test) %>%
+  unnest(value) %>%
+  mutate(temp = 1) %>%
+  pivot_wider(names_from = value, values_from = temp, values_fill = list(temp = 0)) %>%
+  select(c('Waarschijnlijk niet', 'Waarschijnlijk wel', 'Weet het niet', 'Zeker niet', 'Zeker wel')) %>%
+  as.matrix()
+
+```
+
+## Step 1: Word2Vec: Building Neural Network
+
+If you are interested in the essence of Neural Networks, [Deep Learning with R](https://www.manning.com/books/deep-learning-with-r) is an excellent work.
+
+When we want to use a neural network to train word embeddings on our survey response data, we need to convert the tokens into integers so that the neural network can take the data as an input; you cannot feed text directly into a neural network. In neural network terms we need a 2 dimensional tensor with responses (samples) and word vectors (features). Remember that this requires the input features to be of the same length. Below we will vectorize our text, create an index and use padding (add zeros) to create equal sizes.
+
+
+```{r}
+# maximum number of words for a response
+max_length <- 20
+
+# Vectorize the tokens, each token will receive a unique integer, the index of that token in a dictionary.
+tokenizer_train <- layer_text_vectorization(
+  output_mode = "int",
+  output_sequence_length = max_length,
+) %>% adapt(x_train)
+
+tokenizer_test <- layer_text_vectorization(
+  output_mode = "int",
+  output_sequence_length = max_length,
+) %>% adapt(x_test)
+
+
+# and make sure that every sequence has the same length (Keras requirement)
+input_train <- tokenizer_train(x_train)
+input_test <- tokenizer_train(x_test)
+
+```
+
+Now we have transformed our response text into integers, put them into the response sequence and added zero's for empty spaces in the tensor. Let us check what the original data for one response (number 100) looks like compared to the mapping to integers made by the Keras tokenizer. If all went well every original word has been replaced by a unique integer. These integers (which can be mapped back to words) will be input for our neural network.
+
+```{r}
+
+cat(paste0('Original text of response number 100 without interpunction, low frequency words and stopwords:', '\n' ,x_train[100],'\n\n'))
+cat(paste0('What this response looks like converted to integers:'),'\n', (as.array(input_train[100,])),'\n\n')
+
+```
+
+Next we build the structure of our neural network. In general word embeddings may have 100, 300 or even more dimensions, depending on the size of the vocabulary. Here since our dataset is small, we use 32 dimensions for our model. The word embedding is trained using a Keras embedding layer. It will start with random weights and update itself based upon the loss function and optimizer. The layer_embedding needs the size of the input (the number of unique tokens + 1), the output dimension (32 word embedding dimensions) and can also deal with a maximum review length (150 words).
+
+```{r}
+# how many dimensions do we want our word2vec embedding to have
+word2vecdim <- 32
+
+# how many words are in the index
+num_tokens <- tokenizer_train$vocabulary_size()
+
+model <- keras_model_sequential() %>% 
+  # Specify the maximum input lengthand input_dim (unique tokens+1) and choose 32 dimensions
+  layer_embedding(input_dim = num_tokens+1, 
+                  output_dim = word2vecdim, 
+                  input_length = max_length,
+                  mask_zero = TRUE,                 
+                 ) %>% 
+  # We flatten the 3D tensor of embeddings into a 2D tensor of shape `(samples, max_length * word2vecdim)`
+  layer_flatten() %>% 
+  # add a dense layer with 32 units
+  layer_dropout(0.3) %>% 
+  layer_dense(units = 32, activation = "relu") %>%
+    layer_dropout(0.3) %>% 
+  # add the classifier on top
+  layer_dense(units = 5, activation = "softmax")
+
+model %>% compile(
+  optimizer = "rmsprop",
+  loss = "categorical_crossentropy",
+  # retrieve accuracy as measure
+  metrics = c("acc")
+)
+
+history <- model %>% fit(
+  x=input_train, y=as.matrix(y_train),
+  # maximum number of iterations
+  epochs = 20,
+  # how many reviews do we offer in each batch
+  batch_size = 400,
+  # check train results against test data
+  validation_data = list(input_test, as.matrix(y_test))
+)
+
+
+```
+
+We extract the weights of the model to look at our 32 embedding dimensions. Below you will see the dimension for word number 495 / leren.
+
+```{r}
+# get embedding matrix, the weights from the model
+word2vec_embedding <- get_weights(model)[[1]]
+
+# give the index back the name of the word for looking up a word embedding (NA for blanks)
+rownames(word2vec_embedding) <- c('NA',as.vector(unlist(tokenizer_train$get_vocabulary())))
+
+# let's look up word 495 ("aanraden") again, the index shifted with 1 as NAs are now on top of the list 
+print(rownames(word2vec_embedding)[496])
+word2vec_embedding[495,]
+
+```
+
+```{r}
+# find words that are related to another word 
+token <- "kinderen"
+embedding_vector <- t(matrix(word2vec_embedding[token,])) 
+cos_sim = sim2(x = word2vec_embedding, y = embedding_vector, method = "cosine", norm = "l2")
+cat(paste0('Words from the embedding layer similar to "ziek":', '\n'))
+print(head(sort(cos_sim[,1], decreasing = TRUE), 10))
+```
+## Step 2: Predicting fertility intentions
+
+```{r}
+# how many dimensions do we want our word2vec embedding to have
+word2vecdim <- 32
+ 
+# how many words are in the index
+num_tokens <- tokenizer_train$vocabulary_size()
+ 
+# Build our model
+model_word2vec <- keras_model_sequential() %>% 
+  # Specify the maximum input length and input_dim (unique tokens+1) and choose 32 dimensions
+  layer_embedding(input_dim = num_tokens+1, 
+                  output_dim = word2vecdim, 
+                  input_length = max_length,
+                  mask_zero = TRUE,   
+                  weights = list(word2vec_embedding), # add weights from our previously trained embedding model
+                  trainable = FALSE
+                 ) %>% 
+  # We flatten the 3D tensor of embeddings into a 2D tensor of shape `(samples, max_length * word2vecdim)`
+  layer_flatten() %>% 
+  # add a dense layer with 32 units
+  layer_dense(units = 40, activation = "relu", kernel_initializer = "he_normal", bias_initializer = "zeros", kernel_regularizer = regularizer_l2(0.05)) %>% layer_dropout(rate = 0.2) %>%
+  # add a dense layer with 20 units
+  layer_dense(units = 20, activation = "relu", kernel_regularizer = regularizer_l2(0.01)) %>%
+  layer_dropout(0.3) %>% 
+  # add the classifier on top
+  layer_dense(units = 5, activation = "softmax")
+  
+```
+
+
+```{r}
+
+model_word2vec %>% compile(
+  optimizer = "rmsprop",
+  loss = "categorical_crossentropy",
+  # retrieve accuracy as measure
+  metrics = c("acc")
+)
+
+history <- model_word2vec %>% fit(
+  x=input_test, y=as.matrix(y_test),
+  # maximum number of iterations
+  epochs = 20,
+  # how many reviews do we offer in each batch
+  batch_size = 400,
+  # check train results against test data
+  validation_data = list(input_train, as.matrix(y_train))
+)
+
+```
+
+```{r}
+word2vec_result <- as.data.frame(predict(model_word2vec, input_test))
+word2vec_result <- word2vec_result |> rowwise() |>
+  mutate(across(where(is.numeric),~{
+  1L*(.x == max(c_across(where(is.numeric))) )
+  })) |> ungroup()
+ytest <- as.matrix(y_test)
+sA <- as.factor(apply(word2vec_result,1,paste,collapse=' '))
+sB <- as.factor(apply(ytest,1,paste,collapse=' '))
+
+confusionMatrix(sA, sB)
+
+```
+
+
+
+
